@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
-from functools import lru_cache
 from pathlib import Path
 
 import pyarrow.parquet as pq
@@ -24,21 +23,18 @@ def recommend(
     if not 1 <= current_location_id <= ZONE_COUNT:
         raise ValueError("current_location_id must be in 1..263")
 
-    counts = _load_pickup_counts()
     target_time = _next_half_hour(current_datetime)
+    slot = target_time.hour * 2 + target_time.minute // 30
 
-    # TODO:
-    # 1. Read the 263 pickup counts at
-    #    counts[target_time.weekday()][target_time_slot].
-    # 2. Use these counts directly as recommendation scores.
-    # 3. Return three LocationIDs by score from high to low. If scores are
-    #    equal, the smaller LocationID must come first.
-    #
-    # Baseline 1 intentionally ignores current_location_id after validation.
-    raise NotImplementedError("TODO: implement the hot-zone strategy")
+    # TODO 1: Build the 263 demand scores for target_time.weekday() and slot.
+    # The score of a zone is its historical pickup_count in the next slot.
+    scores: list[float] = []
+
+    # TODO 2: Implement Top-3 selection in descending score order.
+    # Break ties by choosing the smaller LocationID first.
+    raise NotImplementedError("complete Baseline 1 scoring and Top-3 selection")
 
 
-@lru_cache(maxsize=1)
 def _load_pickup_counts() -> list[list[list[float]]]:
     """Load the provided weekday x slot x zone pickup-count table once."""
     counts = [[[0.0] * ZONE_COUNT for _ in range(48)] for _ in range(7)]
@@ -63,3 +59,7 @@ def _next_half_hour(value: datetime) -> datetime:
         microsecond=0,
     )
     return slot_start + timedelta(minutes=30)
+
+
+# Read the statistics once when the strategy file is loaded.
+counts = _load_pickup_counts()

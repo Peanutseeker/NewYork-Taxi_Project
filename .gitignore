@@ -2,3 +2,6 @@ tmp/
 tests/
 .vscode
 __pycache__
+
+.gitignore
+bendi

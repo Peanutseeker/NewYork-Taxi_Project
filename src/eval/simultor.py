@@ -12,6 +12,7 @@ from pathlib import Path
 import random
 import statistics
 import sys
+from time import perf_counter
 from types import ModuleType
 from typing import Callable, Sequence
 
@@ -24,23 +25,24 @@ SIMULATION_START = datetime(2023, 2, 1, 0, 0)
 SIMULATION_END = datetime(2023, 3, 1, 0, 0)
 SIMULATION_DAYS = 28
 START_LOCATION_ID = 132
-DEMAND_SCALE = 20.0
+DEMAND_HALF_SATURATION = 40.0
+TOP3_WEIGHTS = (0.6, 0.3, 0.1)
 Strategy = Callable[[datetime, int], Sequence[int] | tuple[Sequence[int], object]]
 
 
 class MarketCell:
     """Compact collection of real trips available in one zone and slot."""
 
-    __slots__ = ("dropoff_zones", "fares", "duration_slots")
+    __slots__ = ("dropoff_zones", "incomes", "duration_slots")
 
     def __init__(self) -> None:
         self.dropoff_zones = array("H")
-        self.fares = array("f")
+        self.incomes = array("f")
         self.duration_slots = array("B")
 
-    def append(self, dropoff_zone: int, fare: float, duration_slots: int) -> None:
+    def append(self, dropoff_zone: int, income: float, duration_slots: int) -> None:
         self.dropoff_zones.append(dropoff_zone)
-        self.fares.append(fare)
+        self.incomes.append(income)
         self.duration_slots.append(duration_slots)
 
     def __len__(self) -> int:
@@ -54,14 +56,8 @@ class SimulationResult:
     served_trips: int
     relocation_count: int
     elapsed_slots: int
-
-
-@dataclass(frozen=True)
-class QueryPrediction:
-    current_location_id: int
-    target_weekday: int
-    target_time_slot: int
-    top3: tuple[int, int, int]
+    recommend_calls: int
+    recommend_time_seconds: float
 
 
 def load_strategy(strategy_path: Path) -> Strategy:
@@ -90,14 +86,14 @@ def pickup_probability(demand: int) -> float:
     """Map non-negative demand to [0, 1) with a concave saturation curve."""
     if demand < 0:
         raise ValueError("demand cannot be negative")
-    return 1.0 - math.exp(-demand / DEMAND_SCALE)
+    return demand / (demand + DEMAND_HALF_SATURATION)
 
 
 def minutes_to_slots(minutes: float) -> int:
-    """Round half up to 30-minute slots and enforce at least one slot."""
+    """Round minutes to the nearest half-hour and enforce one slot."""
     if not math.isfinite(minutes) or minutes < 0:
         raise ValueError("travel time must be a finite non-negative number")
-    return max(1, int(math.floor(minutes / SLOT_MINUTES + 0.5)))
+    return max(1, math.floor(minutes / SLOT_MINUTES + 0.5))
 
 
 def load_trip_market(trips_path: Path) -> dict[int, MarketCell]:
@@ -109,11 +105,11 @@ def load_trip_market(trips_path: Path) -> dict[int, MarketCell]:
         "tpep_dropoff_datetime",
         "PULocationID",
         "DOLocationID",
-        "fare_amount",
+        "total_amount",
     ]
     for batch in parquet.iter_batches(columns=columns, batch_size=65_536):
         values = [batch.column(column).to_pylist() for column in columns]
-        for pickup_time, dropoff_time, raw_pickup, raw_dropoff, raw_fare in zip(
+        for pickup_time, dropoff_time, raw_pickup, raw_dropoff, raw_total in zip(
             *values
         ):
             if not isinstance(pickup_time, datetime) or not isinstance(
@@ -137,10 +133,10 @@ def load_trip_market(trips_path: Path) -> dict[int, MarketCell]:
             duration_minutes = (dropoff_time - pickup_time).total_seconds() / 60.0
             if not 0.0 < duration_minutes <= 240.0:
                 continue
-            fare = 0.0 if raw_fare is None else float(raw_fare)
-            if not math.isfinite(fare):
-                fare = 0.0
-            fare = max(0.0, fare)
+            income = 0.0 if raw_total is None else float(raw_total)
+            if not math.isfinite(income):
+                income = 0.0
+            income = max(0.0, income)
 
             day_index = (pickup_time.date() - SIMULATION_START.date()).days
             time_slot = (pickup_time.hour * 60 + pickup_time.minute) // SLOT_MINUTES
@@ -151,7 +147,7 @@ def load_trip_market(trips_path: Path) -> dict[int, MarketCell]:
                 market[key] = cell
             cell.append(
                 dropoff_zone,
-                fare,
+                income,
                 minutes_to_slots(duration_minutes),
             )
     return market
@@ -172,36 +168,6 @@ def load_travel_time_matrix(path: Path) -> list[list[float]]:
     if len(matrix) != ZONE_COUNT:
         raise ValueError("travel-time matrix must have 263 origin rows")
     return matrix
-
-
-def run_query_file(strategy: Strategy, queries_path: Path) -> list[QueryPrediction]:
-    """Call a strategy for formula-based evaluation queries."""
-    columns = ["current_location_id", "query_time", "weekday", "time_slot"]
-    predictions = []
-    for row in pq.read_table(queries_path, columns=columns).to_pylist():
-        query_time = row["query_time"]
-        if not isinstance(query_time, datetime):
-            raise TypeError("query_time must be a datetime")
-        current_location_id = int(row["current_location_id"])
-        if query_time.weekday() != int(row["weekday"]):
-            raise ValueError("query weekday does not match query_time")
-        current_slot = (query_time.hour * 60 + query_time.minute) // SLOT_MINUTES
-        if current_slot != int(row["time_slot"]):
-            raise ValueError("query time_slot does not match query_time")
-        top3 = call_strategy(strategy, query_time, current_location_id)
-        target_time = _next_slot_time(query_time)
-        predictions.append(
-            QueryPrediction(
-                current_location_id=current_location_id,
-                target_weekday=target_time.weekday(),
-                target_time_slot=(
-                    target_time.hour * 60 + target_time.minute
-                )
-                // SLOT_MINUTES,
-                top3=top3,
-            )
-        )
-    return predictions
 
 
 def call_strategy(
@@ -227,6 +193,29 @@ def call_strategy(
     return top3  # type: ignore[return-value]
 
 
+def choose_destination(
+    top3: tuple[int, int, int],
+    current_location_id: int,
+    travel_times: list[list[float]],
+    rng: random.Random,
+) -> int:
+    """Sample a reachable Top-3 destination with 60/30/10 rank weights."""
+    reachable = [
+        (zone, weight)
+        for zone, weight in zip(top3, TOP3_WEIGHTS)
+        if math.isfinite(travel_times[current_location_id - 1][zone - 1])
+    ]
+    if not reachable:
+        return current_location_id
+    threshold = rng.random() * sum(weight for _, weight in reachable)
+    cumulative = 0.0
+    for zone, weight in reachable:
+        cumulative += weight
+        if threshold < cumulative:
+            return zone
+    return reachable[-1][0]
+
+
 def simulate_once(
     *,
     strategy: Strategy,
@@ -241,6 +230,8 @@ def simulate_once(
     total_income = 0.0
     served_trips = 0
     relocation_count = 0
+    recommend_calls = 0
+    recommend_time_seconds = 0.0
 
     while current_time < SIMULATION_END:
         day_index = (current_time.date() - SIMULATION_START.date()).days
@@ -250,15 +241,23 @@ def simulate_once(
 
         if cell is not None and rng.random() < pickup_probability(demand):
             trip_index = rng.randrange(demand)
-            total_income += float(cell.fares[trip_index])
+            total_income += float(cell.incomes[trip_index])
             current_location_id = int(cell.dropoff_zones[trip_index])
             occupied_slots = int(cell.duration_slots[trip_index])
             current_time += timedelta(minutes=occupied_slots * SLOT_MINUTES)
             served_trips += 1
             continue
 
+        recommend_start = perf_counter()
         top3 = call_strategy(strategy, current_time, current_location_id)
-        destination = top3[0]
+        recommend_time_seconds += perf_counter() - recommend_start
+        recommend_calls += 1
+        destination = choose_destination(
+            top3,
+            current_location_id,
+            travel_times,
+            rng,
+        )
         travel_minutes = travel_times[current_location_id - 1][destination - 1]
         travel_slots = minutes_to_slots(travel_minutes)
         current_location_id = destination
@@ -274,6 +273,8 @@ def simulate_once(
         served_trips=served_trips,
         relocation_count=relocation_count,
         elapsed_slots=elapsed_slots,
+        recommend_calls=recommend_calls,
+        recommend_time_seconds=recommend_time_seconds,
     )
 
 
@@ -282,7 +283,7 @@ def simulate_many(
     strategy: Strategy,
     market: dict[int, MarketCell],
     travel_times: list[list[float]],
-    runs: int = 100,
+    runs: int = 200,
     base_seed: int = 20230717,
 ) -> dict[str, object]:
     """Run independent simulations and average daily strategy income."""
@@ -298,19 +299,31 @@ def simulate_many(
         for run_index in range(runs)
     ]
     daily_incomes = [result.average_daily_income for result in results]
+    total_incomes = [result.total_income for result in results]
+    recommend_calls = sum(result.recommend_calls for result in results)
+    recommend_time = sum(result.recommend_time_seconds for result in results)
     return {
+        "simulator_version": 5,
         "score": statistics.fmean(daily_incomes),
-        "metric": "average_daily_fare_income",
+        "metric": "average_daily_total_income",
         "runs": runs,
         "days_per_run": SIMULATION_DAYS,
         "income_stddev": statistics.pstdev(daily_incomes),
+        "average_total_income": statistics.fmean(total_incomes),
+        "total_income_across_runs": sum(total_incomes),
+        "average_recommend_time_ms": recommend_time / recommend_calls * 1_000,
+        "recommend_calls": recommend_calls,
+        "total_recommend_time_seconds": recommend_time,
         "average_served_trips": statistics.fmean(
             result.served_trips for result in results
         ),
         "average_relocations": statistics.fmean(
             result.relocation_count for result in results
         ),
-        "pickup_probability": "1 - exp(-demand / 20)",
+        "pickup_probability": "demand / (demand + 40)",
+        "decision_order": "pickup -> occupied trip, or recommend -> relocate",
+        "time_progression": "30-minute slots with round-half-up",
+        "top3_sampling_weights": list(TOP3_WEIGHTS),
         "start_location_id": START_LOCATION_ID,
         "base_seed": base_seed,
         "first_run": asdict(results[0]),
@@ -319,12 +332,3 @@ def simulate_many(
 
 def _market_key(day_index: int, time_slot: int, location_id: int) -> int:
     return (day_index * 48 + time_slot) * ZONE_COUNT + location_id - 1
-
-
-def _next_slot_time(value: datetime) -> datetime:
-    slot_start = value.replace(
-        minute=(value.minute // SLOT_MINUTES) * SLOT_MINUTES,
-        second=0,
-        microsecond=0,
-    )
-    return slot_start + timedelta(minutes=SLOT_MINUTES)
